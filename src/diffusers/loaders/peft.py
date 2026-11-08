@@ -282,6 +282,11 @@ class PeftAdapterMixin:
                     adapter_config.modules_to_save = adapter_config.exclude_modules
                     adapter_config.exclude_modules = None
 
+            if getattr(self, "quantization_method", None) == "convrot":
+                from ..quantizers.convrot.lora import register_convrot_lora
+
+                register_convrot_lora(adapter_config)
+
             # <Unsafe code
             # We can be sure that the following works as it just sets attention processors, lora layers and puts all in the same dtype
             # Now we remove any existing hooks to `_pipeline`.
@@ -425,7 +430,7 @@ class PeftAdapterMixin:
         lora_adapter_metadata = self.peft_config[adapter_name].to_dict()
 
         lora_layers_to_save = get_peft_model_state_dict(
-            self.to(dtype=torch.float32 if upcast_before_saving else None), adapter_name=adapter_name
+            self.to(dtype=torch.float32) if upcast_before_saving else self, adapter_name=adapter_name
         )
         if os.path.isfile(save_directory):
             raise ValueError(f"Provided path ({save_directory}) should be a directory, not a file")
@@ -549,6 +554,10 @@ class PeftAdapterMixin:
         # Unlike transformers, here we don't need to retrieve the name_or_path of the unet as the loading logic is
         # handled by the `load_lora_layers` or `StableDiffusionLoraLoaderMixin`. Therefore we set it to `None` here.
         adapter_config.base_model_name_or_path = None
+        if getattr(self, "quantization_method", None) == "convrot":
+            from ..quantizers.convrot.lora import register_convrot_lora
+
+            register_convrot_lora(adapter_config)
         inject_adapter_in_model(adapter_config, self, adapter_name)
         self.set_adapter(adapter_name)
 
@@ -670,6 +679,8 @@ class PeftAdapterMixin:
     def fuse_lora(self, lora_scale=1.0, safe_fusing=False, adapter_names=None):
         if not USE_PEFT_BACKEND:
             raise ValueError("PEFT backend is required for `fuse_lora()`.")
+        if getattr(self, "quantization_method", None) == "convrot":
+            raise ValueError("ConvRot INT8 LoRA adapters cannot be fused. Keep the adapters loaded during inference.")
 
         self.lora_scale = lora_scale
         self._safe_fusing = safe_fusing

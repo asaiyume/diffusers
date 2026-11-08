@@ -81,8 +81,11 @@ Unquantized layers use the requested precision, except for modules the model kee
 computation are supported.
 
 This integration loads prequantized single-file transformer checkpoints. It does not support the older
-ComfyUI-INT8-Fast marker format, other Comfy quantization formats, on-load quantization, training, LoRA, attention
-projection fusion, or `save_pretrained` for the quantized transformer.
+ComfyUI-INT8-Fast marker format, other Comfy quantization formats, on-load quantization, training, DoRA, LoRA fusion,
+attention projection fusion, or `save_pretrained` for the quantized transformer.
+
+LoRA loading keeps the base weights INT8 and runs the adapter branch in the configured compute dtype. Load adapters
+with `load_lora_weights` before enabling offloading. Adapter scaling, disabling, and unloading use the standard LoRA APIs.
 
 ## MiniMax-H3
 
@@ -112,3 +115,33 @@ the loaded model as the modular pipeline's `transformer_ref` component.
 MiniMax-H3 uses the existing modular video/audio workflow. Its INT8 transformer is still large, so phase prompt
 encoding, denoising, and VAE decoding separately when host memory is limited, and offload transformer blocks as
 needed. See the [MiniMax-H3 pipeline guide](../api/pipelines/minimax_h3) for packing and sampling constraints.
+
+### LightX2V FL2VA 8-step LoRA
+
+After loading the FL2VA components and registering the INT8 transformer as `pipe.transformer`, load the adapter:
+
+```python
+pipe.load_lora_weights(
+    "lightx2v/Minimax-h3-Turbo",
+    weight_name="minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors",
+    adapter_name="lightx2v",
+)
+pipe.set_adapters("lightx2v", adapter_weights=1.0)
+pipe.scheduler.set_shift(12.0)
+pipe.audio_scheduler.set_shift(3.0)
+
+result = pipe(
+    prompt=prompt,
+    image=first_frame,
+    last_image=last_frame,
+    height=544,
+    width=960,
+    num_frames=124,
+    num_inference_steps=9,
+    output=["videos", "audio", "sampling_rate"],
+)
+```
+
+This adapter's metadata records `alpha=8` with rank 128. The H3 loader applies the internal multiplier `8 / 128`,
+so the user-facing adapter weight remains `1.0`. The scheduler includes the terminal zero in its grid count:
+`num_inference_steps=9` produces eight transformer evaluations.
