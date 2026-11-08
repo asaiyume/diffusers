@@ -696,3 +696,121 @@ def test_h3_vae_native_encode_decode(tmp_path, h3_vae_checkpoint, native_kitchen
     assert encoded.shape == (1, 4, 1, 2, 2)
     assert decoded.shape == (1, 3, 22, 8, 8)
     assert torch.isfinite(encoded).all() and torch.isfinite(decoded).all()
+
+
+@pytest.fixture
+def lora_transformer():
+    pytest.importorskip("peft")
+    model = MiniMaxH3Transformer3DModel(**{**h3_config(), "hidden_size": 256}).to(torch.bfloat16)
+    prefix = "transformer_blocks.0.attn.to_q"
+    state = checkpoint(prefix)
+    quantizer = ConvRotQuantizer(ConvRotQuantizationConfig())
+    quantizer.preprocess_model(model, device_map=None, state_dict=state)
+    for name, value in state.items():
+        quantizer.create_quantized_param(model, value, name, "cpu", state)
+    return model
+
+
+@pytest.mark.lora
+@pytest.mark.parametrize("low_cpu_mem_usage", [False, True])
+def test_h3_convrot_lora_metadata_and_adapter_controls(lora_transformer, tmp_path, low_cpu_mem_usage):
+    from safetensors.torch import save_file
+
+    from diffusers.modular_pipelines.minimax_h3.modular_blocks_minimax_h3 import MiniMaxH3FL2VACoreDenoiseStep
+    from diffusers.quantizers.convrot.lora import ConvRotLoraLinear
+
+    pipe = MiniMaxH3FL2VACoreDenoiseStep().init_pipeline()
+    pipe.update_components(transformer=lora_transformer)
+    base = lora_transformer.transformer_blocks[0].attn.to_q
+    weight, scale = base.weight.clone(), base.weight_scale.clone()
+    state = {
+        "transformer_blocks.0.attn.to_q.lora_A.default.weight": torch.randn(128, 256, dtype=torch.bfloat16),
+        "transformer_blocks.0.attn.to_q.lora_B.default.weight": torch.randn(32, 128, dtype=torch.bfloat16),
+        "context_embedder.lora_A.default.weight": torch.randn(128, 8, dtype=torch.bfloat16),
+        "context_embedder.lora_B.default.weight": torch.randn(256, 128, dtype=torch.bfloat16),
+    }
+    save_file(state, tmp_path / "adapter.safetensors", metadata={"alpha": "8"})
+    pipe.load_lora_weights(
+        tmp_path, weight_name="adapter.safetensors", adapter_name="turbo", low_cpu_mem_usage=low_cpu_mem_usage
+    )
+    layer = lora_transformer.transformer_blocks[0].attn.to_q
+    assert isinstance(layer, ConvRotLoraLinear)
+    assert layer.get_base_layer() is base
+    assert layer.scaling["turbo"] == 8 / 128
+    assert layer.compute_dtype == torch.bfloat16
+    assert layer.lora_A["turbo"].weight.dtype == torch.bfloat16
+    torch.testing.assert_close(layer.lora_A["turbo"].weight, state[next(iter(state))], rtol=0, atol=0)
+    pipe.set_adapters("turbo", adapter_weights=0.5)
+    assert layer.scaling["turbo"] == 0.5 * 8 / 128
+    pipe.disable_lora()
+    assert layer.disable_adapters
+    pipe.enable_lora()
+    assert not layer.disable_adapters
+    with pytest.raises(ValueError, match="cannot be fused"):
+        pipe.fuse_lora(lora_scale=2.0)
+    assert layer.scaling["turbo"] == 0.5 * 8 / 128
+    assert not lora_transformer.context_embedder.merged
+    lora_transformer.save_lora_adapter(tmp_path / "saved", adapter_name="turbo")
+    lora_transformer.load_lora_adapter(
+        tmp_path / "saved",
+        prefix=None,
+        adapter_name="reloaded",
+        weight_name="pytorch_lora_weights.safetensors",
+        use_safetensors=True,
+    )
+    assert layer.scaling["reloaded"] == 8 / 128
+    torch.testing.assert_close(layer.lora_A["reloaded"].weight, layer.lora_A["turbo"].weight, rtol=0, atol=0)
+    pipe.delete_adapters("reloaded")
+    assert "reloaded" not in layer.lora_A
+    pipe.unload_lora_weights()
+    assert lora_transformer.transformer_blocks[0].attn.to_q is base
+    assert base.weight.dtype == torch.int8
+    assert base.weight_scale.dtype == torch.float32
+    torch.testing.assert_close(base.weight, weight, rtol=0, atol=0)
+    torch.testing.assert_close(base.weight_scale, scale, rtol=0, atol=0)
+
+
+@pytest.mark.lora
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("rotated", [False, True])
+def test_convrot_lora_native_output_and_offload(lora_transformer, native_kitchen, dtype, rotated):
+    from accelerate import cpu_offload_with_hook
+    from peft import LoraConfig
+
+    model = lora_transformer
+    base = model.transformer_blocks[0].attn.to_q
+    base.compute_dtype = dtype
+    base.convrot = rotated
+    inputs = torch.randn(2, 7, 512, device="cuda", dtype=dtype)[..., ::2]
+    for name in ("first", "second"):
+        model.add_adapter(
+            LoraConfig(r=8, lora_alpha=2, target_modules=["transformer_blocks.0.attn.to_q"]), adapter_name=name
+        )
+    layer = model.transformer_blocks[0].attn.to_q
+    with torch.no_grad():
+        for name in ("first", "second"):
+            layer.lora_A[name].weight.normal_(std=0.1)
+            layer.lora_B[name].weight.normal_(std=0.1)
+    model.set_adapters(["first", "second"], weights=[0.5, -0.25])
+    layer, hook = cpu_offload_with_hook(layer, execution_device=torch.device("cuda"))
+    with torch.inference_mode(), native_kitchen.use_backend("cuda"):
+        actual = layer(inputs)
+        expected = base(inputs)
+        for name, multiplier in (("first", 0.5), ("second", -0.25)):
+            a, b = layer.lora_A[name].weight, layer.lora_B[name].weight
+            expected = expected + torch.nn.functional.linear(torch.nn.functional.linear(inputs, a), b) * (
+                multiplier * 2 / 8
+            )
+            assert a.dtype == b.dtype == dtype
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        model.disable_lora()
+        torch.testing.assert_close(layer(inputs), base(inputs), rtol=0, atol=0)
+        model.enable_lora()
+        hook.offload()
+        assert base.weight.device.type == "cpu"
+        assert layer.lora_A["first"].weight.device.type == "cpu"
+        torch.testing.assert_close(layer(inputs), actual, rtol=0, atol=0)
+    assert actual.dtype == dtype
+    assert base.weight.dtype == torch.int8
+    assert base.weight_scale.dtype == torch.float32
+    hook.offload()
