@@ -31,6 +31,7 @@ from ..utils import deprecate, is_accelerate_available, is_torch_version, loggin
 from ..utils.torch_utils import empty_device_cache
 from .single_file_utils import (
     SingleFileComponentError,
+    _BlockwiseSafetensorsCheckpoint,
     convert_animatediff_checkpoint_to_diffusers,
     convert_auraflow_transformer_checkpoint_to_diffusers,
     convert_autoencoder_dc_checkpoint_to_diffusers,
@@ -238,6 +239,7 @@ SINGLE_FILE_LOADABLE_CLASSES = {
         "default_subfolder": "transformer",
     },
     "MiniMaxH3Transformer3DModel": {
+        "blockwise": True,
         "checkpoint_mapping_fn": convert_minimax_h3_transformer_checkpoint_to_diffusers,
         "checkpoint_config_fn": infer_minimax_h3_checkpoint_config,
         "default_subfolder": "transformer",
@@ -401,6 +403,12 @@ class FromOriginalModelMixin:
                 f"Passed `torch_dtype` {torch_dtype} is not a `torch.dtype`. Defaulting to `torch.float32`."
             )
 
+        mapping_functions = SINGLE_FILE_LOADABLE_CLASSES[mapping_class_name]
+        blockwise = (
+            mapping_functions.get("blockwise", False)
+            and low_cpu_mem_usage
+            and (quantization_config is None or quantization_config.quant_method.value == "convrot")
+        )
         if isinstance(pretrained_model_link_or_path_or_dict, dict):
             checkpoint = pretrained_model_link_or_path_or_dict
         else:
@@ -414,6 +422,7 @@ class FromOriginalModelMixin:
                 revision=revision,
                 disable_mmap=disable_mmap,
                 user_agent=user_agent,
+                blockwise=blockwise,
             )
         if quantization_config is not None:
             if not low_cpu_mem_usage:
@@ -425,8 +434,6 @@ class FromOriginalModelMixin:
 
         else:
             hf_quantizer = None
-
-        mapping_functions = SINGLE_FILE_LOADABLE_CLASSES[mapping_class_name]
 
         checkpoint_mapping_fn = mapping_functions["checkpoint_mapping_fn"]
         if original_config is not None:
@@ -528,48 +535,70 @@ class FromOriginalModelMixin:
 
         checkpoint_mapping_kwargs = _get_mapping_function_kwargs(checkpoint_mapping_fn, **kwargs)
 
-        if _should_convert_state_dict_to_diffusers(model_state_dict, checkpoint):
-            diffusers_format_checkpoint = checkpoint_mapping_fn(
-                config=diffusers_model_config,
-                checkpoint=checkpoint,
-                **checkpoint_mapping_kwargs,
-            )
-        else:
-            diffusers_format_checkpoint = checkpoint
-
-        if not diffusers_format_checkpoint:
+        if not checkpoint:
             raise SingleFileComponentError(
                 f"Failed to load {mapping_class_name}. Weights for this component appear to be missing in the checkpoint."
             )
 
-        if hf_quantizer is not None:
-            hf_quantizer.preprocess_model(
-                model=model,
-                device_map=None,
-                state_dict=diffusers_format_checkpoint,
-                keep_in_fp32_modules=keep_in_fp32_modules,
-            )
-
+        is_blockwise = isinstance(checkpoint, _BlockwiseSafetensorsCheckpoint)
+        should_convert = _should_convert_state_dict_to_diffusers(model_state_dict, checkpoint)
+        checkpoint_blocks = checkpoint.iter_blocks() if is_blockwise else (checkpoint,)
+        if is_blockwise and hf_quantizer is not None and not any(k.endswith(".comfy_quant") for k in checkpoint):
+            raise ValueError("The checkpoint has no native Comfy INT8 quantization markers.")
+        unexpected_keys = []
         device_map = None
+        for checkpoint_block in checkpoint_blocks:
+            if should_convert:
+                diffusers_format_checkpoint = checkpoint_mapping_fn(
+                    config=diffusers_model_config,
+                    checkpoint=checkpoint_block,
+                    **checkpoint_mapping_kwargs,
+                )
+            else:
+                diffusers_format_checkpoint = checkpoint_block
+
+            if not diffusers_format_checkpoint and not is_blockwise:
+                raise SingleFileComponentError(
+                    f"Failed to load {mapping_class_name}. Weights for this component appear to be missing in the checkpoint."
+                )
+
+            if hf_quantizer is not None:
+                hf_quantizer.preprocess_model(
+                    model=model,
+                    device_map=None,
+                    state_dict=diffusers_format_checkpoint,
+                    keep_in_fp32_modules=keep_in_fp32_modules,
+                    allow_unquantized=is_blockwise,
+                )
+
+            if low_cpu_mem_usage:
+                param_device = torch.device(device) if device else torch.device("cpu")
+                empty_state_dict = model.state_dict()
+                unexpected_keys.extend(
+                    param_name for param_name in diffusers_format_checkpoint if param_name not in empty_state_dict
+                )
+                device_map = {"": param_device}
+                load_model_dict_into_meta(
+                    model,
+                    diffusers_format_checkpoint,
+                    dtype=torch_dtype,
+                    device_map=device_map,
+                    hf_quantizer=hf_quantizer,
+                    keep_in_fp32_modules=keep_in_fp32_modules,
+                    unexpected_keys=unexpected_keys,
+                )
+                del empty_state_dict
+            else:
+                _, unexpected_keys = model.load_state_dict(diffusers_format_checkpoint, strict=False)
+            del diffusers_format_checkpoint, checkpoint_block
+
         if low_cpu_mem_usage:
-            param_device = torch.device(device) if device else torch.device("cpu")
-            empty_state_dict = model.state_dict()
-            unexpected_keys = [
-                param_name for param_name in diffusers_format_checkpoint if param_name not in empty_state_dict
-            ]
-            device_map = {"": param_device}
-            load_model_dict_into_meta(
-                model,
-                diffusers_format_checkpoint,
-                dtype=torch_dtype,
-                device_map=device_map,
-                hf_quantizer=hf_quantizer,
-                keep_in_fp32_modules=keep_in_fp32_modules,
-                unexpected_keys=unexpected_keys,
-            )
             empty_device_cache()
-        else:
-            _, unexpected_keys = model.load_state_dict(diffusers_format_checkpoint, strict=False)
+
+        if is_blockwise and param_device.type != "meta":
+            missing_keys = [name for name, value in model.state_dict().items() if value.is_meta]
+            if missing_keys:
+                raise ValueError(f"The checkpoint left unloaded parameters: {missing_keys}.")
 
         if model._keys_to_ignore_on_load_unexpected is not None:
             for pat in model._keys_to_ignore_on_load_unexpected:

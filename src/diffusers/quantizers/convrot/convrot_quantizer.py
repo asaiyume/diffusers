@@ -45,12 +45,12 @@ class ConvRotQuantizer(DiffusersQuantizer):
         return self.compute_dtype
 
     def _process_model_before_weight_loading(
-        self, model, device_map, state_dict=None, keep_in_fp32_modules=(), **kwargs
+        self, model, device_map, state_dict=None, keep_in_fp32_modules=(), allow_unquantized=False, **kwargs
     ):
         if state_dict is None:
             raise ValueError("ConvRot checkpoints must be loaded with from_single_file().")
         marker_keys = [key for key in state_dict if key.endswith(".comfy_quant")]
-        if not marker_keys:
+        if not marker_keys and not allow_unquantized:
             raise ValueError("The checkpoint has no native Comfy INT8 quantization markers.")
         unmarked = [
             key

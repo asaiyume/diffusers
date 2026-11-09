@@ -19,6 +19,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from packaging.version import Version
+from safetensors.torch import save_file
 from torch import nn
 
 from diffusers import ConvRotQuantizationConfig, MiniMaxH3Transformer3DModel, QwenImage21Transformer2DModel
@@ -443,6 +444,59 @@ def test_h3_single_file_rejects_disabling_low_cpu_mem_usage_with_fp32_modules(tm
         MiniMaxH3Transformer3DModel.from_single_file(
             model.state_dict(), config=str(tmp_path), dtype=torch.bfloat16, low_cpu_mem_usage=False
         )
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("adaln_curve_grid", [None, 5])
+@pytest.mark.parametrize("prefix", ["", "model.diffusion_model."])
+def test_h3_blockwise_single_file_matches_dictionary(tmp_path, request, quantized, adaln_curve_grid, prefix):
+    if quantized:
+        request.getfixturevalue("kitchen")
+    torch.manual_seed(17)
+    config = {**h3_config(), "num_layers": 2}
+    model = MiniMaxH3Transformer3DModel(**config, adaln_curve_grid=adaln_curve_grid)
+    model.save_config(tmp_path)
+    state = dict(model.state_dict())
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if quantized and ".attn." in name:
+            state[f"{name}.weight"] = torch.randint(-127, 128, module.weight.shape, dtype=torch.int8)
+            state[f"{name}.weight_scale"] = torch.rand(module.out_features, 1) + 0.01
+            state[f"{name}.comfy_quant"] = marker(convrot=False)
+    for name in list(state):
+        if name.endswith(".attn.to_q.weight"):
+            base = name.removesuffix(".to_q.weight")
+            for suffix in ("weight", "bias", "weight_scale", "comfy_quant"):
+                keys = [f"{base}.to_{part}.{suffix}" for part in "qkv"]
+                if keys[0] in state:
+                    values = [state.pop(key) for key in keys]
+                    state[f"{base}.qkv_proj.{suffix}"] = values[0] if suffix == "comfy_quant" else torch.cat(values)
+        elif ".ff.net.0.proj." in name:
+            value, gate = state[name].chunk(2, dim=0)
+            state[name] = torch.cat([gate, value])
+    source = {
+        prefix
+        + key.replace("transformer_blocks.", "blocks.")
+        .replace("token_refiner.refiner_blocks.", "token_refiner.blocks.")
+        .replace(".ff.net.0.proj.", ".mlp.fc1.")
+        .replace(".adaln_proj.curve_proj.", ".adaln_proj.linear.")
+        .replace("norm_out.curve_proj.", "final_layer.adaln_proj.linear."): value.contiguous()
+        for key, value in state.items()
+    }
+    path = tmp_path / "model.safetensors"
+    save_file(source, path)
+    kwargs = {"config": str(tmp_path), "dtype": torch.bfloat16}
+    if quantized:
+        kwargs["quantization_config"] = ConvRotQuantizationConfig()
+    expected = MiniMaxH3Transformer3DModel.from_single_file(source, **kwargs)
+    with patch("safetensors.torch.load_file", side_effect=AssertionError("Whole-file load")):
+        actual = MiniMaxH3Transformer3DModel.from_single_file(str(path), **kwargs)
+    assert actual.config == expected.config
+    assert actual.state_dict().keys() == expected.state_dict().keys()
+    for name, value in expected.state_dict().items():
+        torch.testing.assert_close(actual.state_dict()[name], value, rtol=0, atol=0)
+    assert not any(value.is_meta for value in actual.state_dict().values())
 
 
 @pytest.mark.parametrize("adaln_curve_grid", [None, 5])

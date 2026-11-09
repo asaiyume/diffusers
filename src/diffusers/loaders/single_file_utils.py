@@ -15,6 +15,7 @@
 """Conversion script for the Stable Diffusion checkpoints."""
 
 import copy
+import json
 import os
 import re
 from contextlib import nullcontext
@@ -24,6 +25,7 @@ from urllib.parse import urlparse
 import requests
 import torch
 import yaml
+from safetensors.torch import _getdtype
 
 from ..models.modeling_utils import load_state_dict
 from ..schedulers import (
@@ -471,6 +473,50 @@ def _is_legacy_scheduler_kwargs(kwargs):
     return any(k in SCHEDULER_LEGACY_KWARGS for k in kwargs.keys())
 
 
+class _BlockwiseSafetensorsCheckpoint(dict):
+    def __init__(self, path):
+        self.path = path
+        with open(path, "rb") as source:
+            header_size = int.from_bytes(source.read(8), "little")
+            if header_size > 100_000_000:
+                raise ValueError("Safetensors header exceeds the maximum size.")
+            self.header = json.loads(source.read(header_size))
+        self.header.pop("__metadata__", None)
+        self.offset = header_size + 8
+        super().__init__(
+            (name, torch.empty(spec["shape"], dtype=_getdtype(spec["dtype"]), device="meta"))
+            for name, spec in self.header.items()
+        )
+
+    def iter_blocks(self):
+        groups = {}
+        for name in self:
+            parts = name.removeprefix("model.diffusion_model.").split(".")
+            group = tuple(parts[:2]) if parts[0] in ("blocks", "transformer_blocks") else (parts[0],)
+            groups.setdefault(group, []).append(name)
+        with open(self.path, "rb", buffering=0) as source:
+            for names in groups.values():
+                state = {}
+                for name in names:
+                    spec = self.header[name]
+                    tensor = torch.empty(spec["shape"], dtype=self[name].dtype)
+                    start, end = spec["data_offsets"]
+                    data = memoryview(tensor.reshape(-1).view(torch.uint8).numpy())
+                    if end - start != len(data):
+                        raise ValueError(f"Invalid safetensors data offsets for {name}.")
+                    source.seek(self.offset + start)
+                    count = 0
+                    while count < len(data):
+                        read = source.readinto(data[count:])
+                        if not read:
+                            raise ValueError(f"Truncated safetensors tensor: {name}.")
+                        count += read
+                    state[name] = tensor
+                del tensor, data
+                yield state
+                del state
+
+
 def load_single_file_checkpoint(
     pretrained_model_link_or_path,
     force_download=False,
@@ -481,6 +527,7 @@ def load_single_file_checkpoint(
     revision=None,
     disable_mmap=False,
     user_agent=None,
+    blockwise=False,
 ):
     if user_agent is None:
         user_agent = {"file_type": "single_file", "framework": "pytorch"}
@@ -501,6 +548,9 @@ def load_single_file_checkpoint(
             revision=revision,
             user_agent=user_agent,
         )
+
+    if blockwise and str(pretrained_model_link_or_path).endswith(".safetensors"):
+        return _BlockwiseSafetensorsCheckpoint(pretrained_model_link_or_path)
 
     checkpoint = load_state_dict(pretrained_model_link_or_path, disable_mmap=disable_mmap)
 
@@ -4429,7 +4479,7 @@ def convert_minimax_h3_transformer_checkpoint_to_diffusers(checkpoint, config, q
             new_key = new_key.replace("blocks.", "transformer_blocks.", 1)
         for replace_key, rename_key in MINIMAX_H3_KEYS_RENAME_DICT.items():
             new_key = new_key.replace(replace_key, rename_key)
-        if curve_config:
+        if config.get("adaln_curve_grid") is not None:
             new_key = new_key.replace(".adaln_proj.linear.", ".adaln_proj.curve_proj.")
             new_key = new_key.replace("norm_out.linear.", "norm_out.curve_proj.")
 
